@@ -331,6 +331,19 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     setState(() => _clips.remove(clip));
   }
 
+  void _editClipNote(VideoClip clip, String newNote) {
+    final index = _clips.indexOf(clip);
+    if (index == -1) return;
+    final trimmed = newNote.trim();
+    setState(() {
+      _clips[index] = VideoClip(
+        start: clip.start,
+        end: clip.end,
+        note: trimmed.isEmpty ? 'Untitled clip' : trimmed,
+      );
+    });
+  }
+
   // YouTube's oEmbed endpoint needs no API key but only exposes title and
   // channel name -- it has no description field.
   Future<void> _fetchMetadata(String videoId) async {
@@ -621,9 +634,9 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                     ..._clips.map(
                       (clip) => _ClipTile(
                         clip: clip,
-                        onTap: () => _playClip(clip),
-                        // onTap: () {},
+                        onPlay: () => _playClip(clip),
                         onDelete: () => _deleteClip(clip),
+                        onEdit: (newNote) => _editClipNote(clip, newNote),
                       ),
                     ),
                   ],
@@ -723,16 +736,53 @@ class _VideoMetadata extends StatelessWidget {
 class _ClipTile extends StatelessWidget {
   const _ClipTile({
     required this.clip,
-    required this.onTap,
+    required this.onPlay,
     required this.onDelete,
+    required this.onEdit,
   });
 
   final VideoClip clip;
-  final VoidCallback onTap;
+  final VoidCallback onPlay;
   final VoidCallback onDelete;
+  final ValueChanged<String> onEdit;
+
+  Future<void> _openDetail(BuildContext context) async {
+    final controller = TextEditingController(text: clip.note);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(
+          'Clip ${_formatDuration(clip.start)} - ${_formatDuration(clip.end)}',
+        ),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          minLines: 3,
+          maxLines: 8,
+          decoration: const InputDecoration(
+            hintText: 'What happens in this clip?',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(dialogContext).pop(controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (result != null) onEdit(result);
+  }
 
   @override
   Widget build(BuildContext context) {
+    final firstLine = clip.note.split('\n').first;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
@@ -741,17 +791,20 @@ class _ClipTile extends StatelessWidget {
         border: Border.all(color: const Color(0xFFE5E5E5)),
       ),
       child: ListTile(
-        onTap: onTap,
-        leading: const CircleAvatar(
-          backgroundColor: _brandGreen,
-          foregroundColor: Colors.white,
-          child: Icon(Icons.play_arrow),
+        onTap: () => _openDetail(context),
+        leading: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: onPlay,
+          child: const CircleAvatar(
+            backgroundColor: _brandGreen,
+            foregroundColor: Colors.white,
+            child: Icon(Icons.play_arrow),
+          ),
         ),
         title: Text(
-          clip.note.toUpperCase(),
-          maxLines: 2,
+          firstLine.toUpperCase(),
+          maxLines: 1,
           overflow: TextOverflow.ellipsis,
-
           style: const TextStyle(
             color: Color(0xFF0F0F0F),
             fontWeight: FontWeight.bold,
@@ -764,10 +817,23 @@ class _ClipTile extends StatelessWidget {
             color: Color(0xFF0F0F0F),
           ),
         ),
-        trailing: IconButton(
-          onPressed: onDelete,
-          icon: const Icon(Icons.delete_outline, color: Color(0xFF606060)),
-          tooltip: 'Delete bookmark',
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              onPressed: () => _openDetail(context),
+              icon: const Icon(
+                Icons.visibility_outlined,
+                color: Color(0xFF606060),
+              ),
+              tooltip: 'View full note',
+            ),
+            IconButton(
+              onPressed: onDelete,
+              icon: const Icon(Icons.delete_outline, color: Color(0xFF606060)),
+              tooltip: 'Delete bookmark',
+            ),
+          ],
         ),
       ),
     );
