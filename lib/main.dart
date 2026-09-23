@@ -142,6 +142,11 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
   Duration _videoDuration = Duration.zero;
   int _viewCount = 0;
 
+  List<VideoClip> _bookmarkPlaybackOrder = [];
+  int _bookmarkPlaybackIndex = -1;
+  bool _isPlayingBookmarks = false;
+  bool _isAdvancingBookmark = false;
+
   void _loadVideo() {
     final url = _urlController.text.trim();
     final videoId = YoutubePlayerController.convertUrlToId(url);
@@ -169,6 +174,9 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
         _furthestWatched = Duration.zero;
         _videoDuration = Duration.zero;
         _viewCount = 0;
+        _bookmarkPlaybackOrder = [];
+        _bookmarkPlaybackIndex = -1;
+        _isPlayingBookmarks = false;
       });
       return;
     }
@@ -196,6 +204,9 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
       _furthestWatched = Duration.zero;
       _videoDuration = Duration.zero;
       _viewCount = 0;
+      _bookmarkPlaybackOrder = [];
+      _bookmarkPlaybackIndex = -1;
+      _isPlayingBookmarks = false;
     });
 
     _valueSubscription = controller.stream.listen(_onPlayerValueChanged);
@@ -245,6 +256,12 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     if (state.position > _furthestWatched) {
       setState(() => _furthestWatched = state.position);
     }
+    if (_isPlayingBookmarks &&
+        _bookmarkPlaybackIndex >= 0 &&
+        _bookmarkPlaybackIndex < _bookmarkPlaybackOrder.length &&
+        state.position >= _bookmarkPlaybackOrder[_bookmarkPlaybackIndex].end) {
+      _advanceBookmarkPlayback();
+    }
   }
 
   Future<void> _startClip() async {
@@ -253,6 +270,24 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
 
     final seconds = await controller.currentTime;
     if (!mounted) return;
+
+    // Bookmarks must form an increasing, non-overlapping series so the
+    // "play bookmarks" feature can just walk the list in order.
+    if (_clips.isNotEmpty) {
+      final lastEnd = _clips.last.end;
+      if (seconds < lastEnd.inMilliseconds / 1000) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Start must be at or after your last bookmark\'s end '
+              '(${_formatDuration(lastEnd)}).',
+            ),
+          ),
+        );
+        return;
+      }
+    }
+
     setState(() => _clipStartSeconds = seconds);
   }
 
@@ -316,6 +351,13 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     final videoId = _activeVideoId;
     if (controller == null || videoId == null) return;
 
+    if (_isPlayingBookmarks) {
+      setState(() {
+        _isPlayingBookmarks = false;
+        _bookmarkPlaybackIndex = -1;
+      });
+    }
+
     // seekTo() sends two positional JS arguments, but on web that call is
     // relayed through a postMessage bridge whose handler only supports a
     // single JSON argument -- it silently fails there (works fine on
@@ -325,6 +367,67 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
       videoId: videoId,
       startSeconds: clip.start.inMilliseconds / 1000,
     );
+  }
+
+  // Plays every saved bookmark back to back (1-3, then 8-10, ...), skipping
+  // everything in between. Bookmarks are kept in increasing, non-overlapping
+  // order by the validation in _startClip, so sorting here is just a safety
+  // net.
+  Future<void> _startBookmarkPlayback() async {
+    if (_clips.isEmpty) return;
+    final ordered = List<VideoClip>.from(_clips)
+      ..sort((a, b) => a.start.compareTo(b.start));
+    setState(() {
+      _bookmarkPlaybackOrder = ordered;
+      _isPlayingBookmarks = true;
+      _bookmarkPlaybackIndex = 0;
+    });
+    await _seekToBookmark(0);
+  }
+
+  Future<void> _stopBookmarkPlayback() async {
+    setState(() {
+      _isPlayingBookmarks = false;
+      _bookmarkPlaybackIndex = -1;
+    });
+    await _playerController?.pauseVideo();
+  }
+
+  Future<void> _seekToBookmark(int index) async {
+    final controller = _playerController;
+    final videoId = _activeVideoId;
+    if (controller == null || videoId == null) return;
+    if (index < 0 || index >= _bookmarkPlaybackOrder.length) return;
+
+    final clip = _bookmarkPlaybackOrder[index];
+    await controller.loadVideoById(
+      videoId: videoId,
+      startSeconds: clip.start.inMilliseconds / 1000,
+    );
+  }
+
+  Future<void> _advanceBookmarkPlayback() async {
+    if (_isAdvancingBookmark) return;
+    _isAdvancingBookmark = true;
+    try {
+      final nextIndex = _bookmarkPlaybackIndex + 1;
+      if (nextIndex >= _bookmarkPlaybackOrder.length) {
+        setState(() {
+          _isPlayingBookmarks = false;
+          _bookmarkPlaybackIndex = -1;
+        });
+        await _playerController?.pauseVideo();
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Finished playing all bookmarks.')),
+        );
+        return;
+      }
+      setState(() => _bookmarkPlaybackIndex = nextIndex);
+      await _seekToBookmark(nextIndex);
+    } finally {
+      _isAdvancingBookmark = false;
+    }
   }
 
   void _deleteClip(VideoClip clip) {
@@ -535,7 +638,8 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                         child: OutlinedButton.icon(
                           onPressed:
                               _clipStartSeconds == null &&
-                                  _pendingClipStartSeconds == null
+                                  _pendingClipStartSeconds == null &&
+                                  !_isPlayingBookmarks
                               ? _startClip
                               : null,
                           icon: const Icon(Icons.flag_outlined),
@@ -622,13 +726,36 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                   ],
                   if (_clips.isNotEmpty) ...[
                     const SizedBox(height: 24),
-                    const Text(
-                      'Bookmarks',
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600,
-                        color: Color(0xFF0F0F0F),
-                      ),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Bookmarks',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xFF0F0F0F),
+                          ),
+                        ),
+                        TextButton.icon(
+                          onPressed: _isPlayingBookmarks
+                              ? _stopBookmarkPlayback
+                              : _startBookmarkPlayback,
+                          icon: Icon(
+                            _isPlayingBookmarks
+                                ? Icons.stop_circle_outlined
+                                : Icons.playlist_play,
+                          ),
+                          label: Text(
+                            _isPlayingBookmarks
+                                ? 'Stop (${_bookmarkPlaybackIndex + 1}/${_bookmarkPlaybackOrder.length})'
+                                : 'Play bookmarks',
+                          ),
+                          style: TextButton.styleFrom(
+                            foregroundColor: _brandGreen,
+                          ),
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 8),
                     ..._clips.map(
