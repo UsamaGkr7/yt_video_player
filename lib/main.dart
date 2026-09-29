@@ -1,34 +1,30 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:youtube_player_flutter/youtube_player_flutter.dart';
 
+import 'history_screen.dart';
+import 'video_store.dart';
+
 const _brandGreen = Color(0xFF33A052);
+
+const _playbackRates = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+
+// Resuming a few seconds in, or a few seconds before the end, is more
+// annoying than useful, so those positions start from the beginning instead.
+const _resumeMargin = Duration(seconds: 10);
+const _progressSaveInterval = Duration(seconds: 5);
 
 void main() {
   runApp(const MyApp());
 }
 
-class VideoClip {
-  const VideoClip({required this.start, required this.end, required this.note});
-
-  final Duration start;
-  final Duration end;
-  final String note;
-}
-
-String _formatDuration(Duration duration) {
-  final hours = duration.inHours;
-  final minutes = duration.inMinutes.remainder(60);
-  final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
-  if (hours > 0) {
-    return '$hours:${minutes.toString().padLeft(2, '0')}:$seconds';
-  }
-  return '$minutes:$seconds';
-}
+String _formatRate(double rate) =>
+    rate == rate.roundToDouble() ? '${rate.toInt()}x' : '${rate}x';
 
 String _playerStateLabel(PlayerState state) {
   switch (state) {
@@ -118,6 +114,7 @@ class YoutubePlayerScreen extends StatefulWidget {
 
 class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
   final TextEditingController _urlController = TextEditingController();
+  late final AppLifecycleListener _lifecycleListener;
   YoutubePlayerController? _playerController;
   String? _errorText;
 
@@ -126,6 +123,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
   String? _channelName;
   bool _isLoadingMetadata = false;
   bool _metadataError = false;
+  int _loadToken = 0;
 
   final List<VideoClip> _clips = [];
   double? _clipStartSeconds;
@@ -142,103 +140,231 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
   Duration _videoDuration = Duration.zero;
   int _viewCount = 0;
 
+  Duration _currentPosition = Duration.zero;
+  Duration _lastSavedPosition = Duration.zero;
+  double _playbackRate = 1.0;
+  double? _reportedPlaybackRate;
+  bool _showShortcuts = false;
+
+  List<WatchHistoryEntry> _recentHistory = [];
+  Map<String, int> _recentClipCounts = {};
+
   List<VideoClip> _bookmarkPlaybackOrder = [];
   int _bookmarkPlaybackIndex = -1;
   bool _isPlayingBookmarks = false;
   bool _isAdvancingBookmark = false;
 
+  bool get _canMarkStart =>
+      _clipStartSeconds == null &&
+      _pendingClipStartSeconds == null &&
+      !_isPlayingBookmarks;
+
+  bool get _canMarkStop => _clipStartSeconds != null;
+
+  @override
+  void initState() {
+    super.initState();
+    // Save the resume position when the app is backgrounded or the browser
+    // tab is hidden, since dispose() is not guaranteed to run in either case.
+    _lifecycleListener = AppLifecycleListener(onHide: _saveProgress);
+    HardwareKeyboard.instance.addHandler(_handleShortcut);
+    _loadPreferences();
+    _refreshRecentHistory();
+  }
+
+  Future<void> _loadPreferences() async {
+    final rate = await VideoStore.loadPlaybackRate();
+    if (!mounted) return;
+    setState(() => _playbackRate = rate);
+  }
+
+  Future<void> _refreshRecentHistory() async {
+    final history = (await VideoStore.loadHistory()).take(5).toList();
+    final counts = <String, int>{
+      for (final entry in history)
+        entry.videoId: await VideoStore.clipCount(entry.videoId),
+    };
+    if (!mounted) return;
+    setState(() {
+      _recentHistory = history;
+      _recentClipCounts = counts;
+    });
+  }
+
+  void _closePlayer() {
+    _valueSubscription?.cancel();
+    _videoStateSubscription?.cancel();
+    _playerController?.close();
+  }
+
+  // Must be called inside setState.
+  void _resetVideoState() {
+    _playerController = null;
+    _activeVideoId = null;
+    _videoTitle = null;
+    _channelName = null;
+    _isLoadingMetadata = false;
+    _metadataError = false;
+    _clips.clear();
+    _clipStartSeconds = null;
+    _pendingClipStartSeconds = null;
+    _pendingClipEndSeconds = null;
+    _playerState = PlayerState.unknown;
+    _hasStartedPlaying = false;
+    _playCount = 0;
+    _furthestWatched = Duration.zero;
+    _videoDuration = Duration.zero;
+    _viewCount = 0;
+    _currentPosition = Duration.zero;
+    _lastSavedPosition = Duration.zero;
+    _reportedPlaybackRate = null;
+    _bookmarkPlaybackOrder = [];
+    _bookmarkPlaybackIndex = -1;
+    _isPlayingBookmarks = false;
+  }
+
   void _loadVideo() {
     final url = _urlController.text.trim();
     final videoId = YoutubePlayerController.convertUrlToId(url);
 
-    _valueSubscription?.cancel();
-    _videoStateSubscription?.cancel();
-
     if (videoId == null) {
+      _saveProgress();
+      _closePlayer();
+      _loadToken++;
       setState(() {
+        _resetVideoState();
         _errorText = 'Please enter a valid YouTube URL';
-        _playerController?.close();
-        _playerController = null;
-        _activeVideoId = null;
-        _videoTitle = null;
-        _channelName = null;
-        _isLoadingMetadata = false;
-        _metadataError = false;
-        _clips.clear();
-        _clipStartSeconds = null;
-        _pendingClipStartSeconds = null;
-        _pendingClipEndSeconds = null;
-        _playerState = PlayerState.unknown;
-        _hasStartedPlaying = false;
-        _playCount = 0;
-        _furthestWatched = Duration.zero;
-        _videoDuration = Duration.zero;
-        _viewCount = 0;
-        _bookmarkPlaybackOrder = [];
-        _bookmarkPlaybackIndex = -1;
-        _isPlayingBookmarks = false;
       });
+      _refreshRecentHistory();
       return;
     }
 
-    _playerController?.close();
+    _openVideo(videoId);
+  }
+
+  Future<void> _openVideo(String videoId) async {
+    _saveProgress();
+    final token = ++_loadToken;
+
+    final (entry, clips) = await (
+      VideoStore.historyEntry(videoId),
+      VideoStore.loadClips(videoId),
+    ).wait;
+    // A newer load started while we were reading storage.
+    if (!mounted || token != _loadToken) return;
+
+    final resumeAt = _resumePositionFor(entry);
+    _closePlayer();
     final controller = YoutubePlayerController.fromVideoId(
       videoId: videoId,
       autoPlay: true,
+      startSeconds: resumeAt == null ? null : resumeAt.inMilliseconds / 1000,
     );
     setState(() {
+      _resetVideoState();
       _errorText = null;
       _playerController = controller;
       _activeVideoId = videoId;
-      _videoTitle = null;
-      _channelName = null;
+      _videoTitle = entry?.title;
+      _channelName = entry?.channelName;
       _isLoadingMetadata = true;
-      _metadataError = false;
-      _clips.clear();
-      _clipStartSeconds = null;
-      _pendingClipStartSeconds = null;
-      _pendingClipEndSeconds = null;
-      _playerState = PlayerState.unknown;
-      _hasStartedPlaying = false;
-      _playCount = 0;
-      _furthestWatched = Duration.zero;
-      _videoDuration = Duration.zero;
-      _viewCount = 0;
-      _bookmarkPlaybackOrder = [];
-      _bookmarkPlaybackIndex = -1;
-      _isPlayingBookmarks = false;
+      _videoDuration = entry?.duration ?? Duration.zero;
+      _currentPosition = resumeAt ?? Duration.zero;
+      _lastSavedPosition = _currentPosition;
+      _clips.addAll(clips);
     });
 
     _valueSubscription = controller.stream.listen(_onPlayerValueChanged);
     _videoStateSubscription = controller.videoStateStream.listen(
       _onVideoStateChanged,
     );
+    // Leave the URL field so keyboard shortcuts work straight away.
+    FocusManager.instance.primaryFocus?.unfocus();
 
+    _writeHistory();
     _fetchMetadata(videoId);
     _recordView(videoId);
+
+    if (resumeAt != null) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text('Resumed at ${formatDuration(resumeAt)}'),
+            action: SnackBarAction(label: 'Start over', onPressed: _startOver),
+          ),
+        );
+    }
+  }
+
+  Duration? _resumePositionFor(WatchHistoryEntry? entry) {
+    if (entry == null || entry.position < _resumeMargin) return null;
+    if (entry.duration > Duration.zero &&
+        entry.duration - entry.position < _resumeMargin) {
+      return null;
+    }
+    return entry.position;
+  }
+
+  Future<void> _startOver() async {
+    final controller = _playerController;
+    final videoId = _activeVideoId;
+    if (controller == null || videoId == null) return;
+    await controller.loadVideoById(videoId: videoId, startSeconds: 0);
   }
 
   // Persists how many times each video has been opened (per videoId) across
   // app restarts, so re-opening a video days later continues the same count
   // instead of starting over.
   Future<void> _recordView(String videoId) async {
-    final prefs = await SharedPreferences.getInstance();
-    final key = 'view_count_$videoId';
-    final newCount = (prefs.getInt(key) ?? 0) + 1;
-    await prefs.setInt(key, newCount);
-
+    final newCount = await VideoStore.incrementViewCount(videoId);
     if (!mounted || videoId != _activeVideoId) return;
     setState(() => _viewCount = newCount);
   }
 
+  void _writeHistory() {
+    final videoId = _activeVideoId;
+    if (videoId == null) return;
+    _lastSavedPosition = _currentPosition;
+    VideoStore.upsertHistory(
+      WatchHistoryEntry(
+        videoId: videoId,
+        lastWatched: DateTime.now(),
+        title: _videoTitle,
+        channelName: _channelName,
+        position: _currentPosition,
+        duration: _videoDuration,
+      ),
+    );
+  }
+
+  // Positions reported before playback actually starts can be a stale 0
+  // (before the resume seek lands), so only save once the video has played.
+  void _saveProgress() {
+    if (_hasStartedPlaying) _writeHistory();
+  }
+
+  void _persistClips() {
+    final videoId = _activeVideoId;
+    if (videoId == null) return;
+    VideoStore.saveClips(videoId, List.of(_clips));
+  }
+
   // Tracks basic engagement: whether/how many times playback started, the
-  // furthest point reached, and the total video length -- all in memory for
-  // this session only (no backend yet).
+  // furthest point reached, and the total video length. Play counts and
+  // furthest point are per session; the resume position is persisted.
   void _onPlayerValueChanged(YoutubePlayerValue value) {
     if (!mounted) return;
     final isNewlyPlaying =
         value.playerState == PlayerState.playing &&
         _playerState != PlayerState.playing;
+    final previousState = _playerState;
+    final rateChangedInPlayer =
+        _reportedPlaybackRate != null &&
+        value.playbackRate != _reportedPlaybackRate &&
+        !isNewlyPlaying;
+    _reportedPlaybackRate = value.playbackRate;
+
     setState(() {
       _playerState = value.playerState;
       if (value.metaData.duration > Duration.zero) {
@@ -248,7 +374,25 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
         _hasStartedPlaying = true;
         _playCount++;
       }
+      if (value.playerState == PlayerState.ended) {
+        _currentPosition = _videoDuration;
+      }
+      // Speed changed from YouTube's own settings menu: follow it.
+      if (rateChangedInPlayer && _playbackRates.contains(value.playbackRate)) {
+        _playbackRate = value.playbackRate;
+      }
     });
+
+    // loadVideoById (used for seeking and bookmarks) can reset the speed, so
+    // re-apply the chosen speed every time playback (re)starts.
+    if (isNewlyPlaying) {
+      _playerController?.setPlaybackRate(_playbackRate);
+    }
+    if (previousState != value.playerState &&
+        (value.playerState == PlayerState.paused ||
+            value.playerState == PlayerState.ended)) {
+      _saveProgress();
+    }
   }
 
   void _onVideoStateChanged(YoutubeVideoState state) {
@@ -256,12 +400,145 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     if (state.position > _furthestWatched) {
       setState(() => _furthestWatched = state.position);
     }
+    if (_hasStartedPlaying) {
+      _currentPosition = state.position;
+      if ((_currentPosition - _lastSavedPosition).abs() >=
+          _progressSaveInterval) {
+        _saveProgress();
+      }
+    }
     if (_isPlayingBookmarks &&
         _bookmarkPlaybackIndex >= 0 &&
         _bookmarkPlaybackIndex < _bookmarkPlaybackOrder.length &&
         state.position >= _bookmarkPlaybackOrder[_bookmarkPlaybackIndex].end) {
       _advanceBookmarkPlayback();
     }
+  }
+
+  Future<void> _togglePlayPause() async {
+    final controller = _playerController;
+    if (controller == null) return;
+    if (_playerState == PlayerState.playing) {
+      await controller.pauseVideo();
+    } else {
+      await controller.playVideo();
+    }
+  }
+
+  Future<void> _skip(Duration offset) async {
+    final controller = _playerController;
+    final videoId = _activeVideoId;
+    if (controller == null || videoId == null) return;
+
+    final current = await controller.currentTime;
+    var target = current + offset.inMilliseconds / 1000;
+    if (target < 0) target = 0;
+    if (_videoDuration > Duration.zero) {
+      final max = _videoDuration.inMilliseconds / 1000 - 1;
+      if (target > max) target = max;
+    }
+
+    // See _playClip: seekTo() silently fails on web, so use loadVideoById
+    // there. Elsewhere seekTo() is preferred because it keeps a paused
+    // video paused.
+    if (kIsWeb) {
+      await controller.loadVideoById(videoId: videoId, startSeconds: target);
+    } else {
+      await controller.seekTo(seconds: target, allowSeekAhead: true);
+    }
+  }
+
+  Future<void> _setPlaybackRate(double rate) async {
+    setState(() => _playbackRate = rate);
+    VideoStore.savePlaybackRate(rate);
+    await _playerController?.setPlaybackRate(rate);
+  }
+
+  void _stepPlaybackRate(int direction) {
+    final index = _playbackRates.indexOf(_playbackRate);
+    final next =
+        (index == -1 ? _playbackRates.indexOf(1.0) : index) + direction;
+    if (next < 0 || next >= _playbackRates.length) return;
+    _setPlaybackRate(_playbackRates[next]);
+  }
+
+  Future<void> _openHistory() async {
+    _saveProgress();
+    if (_playerState == PlayerState.playing) _playerController?.pauseVideo();
+
+    final videoId = await Navigator.of(
+      context,
+    ).push<String>(MaterialPageRoute(builder: (_) => const HistoryScreen()));
+    if (!mounted) return;
+    _refreshRecentHistory();
+    if (videoId != null) _openHistoryVideo(videoId);
+  }
+
+  void _openHistoryVideo(String videoId) {
+    _urlController.text = 'https://www.youtube.com/watch?v=$videoId';
+    _openVideo(videoId);
+  }
+
+  // A global handler rather than a Focus widget, because clicking empty
+  // space (especially on web) can leave focus above this screen's widgets.
+  // Shortcuts are ignored while another route or dialog is on top, while
+  // typing in a text field and when a modifier is held, so they never
+  // swallow text entry or browser/OS shortcuts. On web, keys pressed while
+  // the YouTube iframe itself has focus go to YouTube's own shortcuts.
+  // Returns true when the key was handled.
+  bool _handleShortcut(KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return false;
+    if (_playerController == null) return false;
+    if (!(ModalRoute.of(context)?.isCurrent ?? true)) return false;
+    final focusContext = FocusManager.instance.primaryFocus?.context;
+    if (focusContext?.findAncestorWidgetOfExactType<EditableText>() != null) {
+      return false;
+    }
+    final keyboard = HardwareKeyboard.instance;
+    if (keyboard.isControlPressed ||
+        keyboard.isMetaPressed ||
+        keyboard.isAltPressed) {
+      return false;
+    }
+
+    final key = event.logicalKey;
+    final isRepeat = event is KeyRepeatEvent;
+    if (key == LogicalKeyboardKey.arrowLeft) {
+      _skip(const Duration(seconds: -5));
+    } else if (key == LogicalKeyboardKey.arrowRight) {
+      _skip(const Duration(seconds: 5));
+    } else if (isRepeat) {
+      return false;
+    } else {
+      switch (event.character?.toLowerCase()) {
+        case ' ':
+        case 'k':
+          _togglePlayPause();
+        case 'j':
+          _skip(const Duration(seconds: -10));
+        case 'l':
+          _skip(const Duration(seconds: 10));
+        case '[':
+          if (_canMarkStart) _startClip();
+        case ']':
+          if (_canMarkStop) _stopClip();
+        case '<':
+          _stepPlaybackRate(-1);
+        case '>':
+          _stepPlaybackRate(1);
+        case 'b':
+          if (_clips.isNotEmpty) {
+            _isPlayingBookmarks
+                ? _stopBookmarkPlayback()
+                : _startBookmarkPlayback();
+          }
+        case '?':
+          setState(() => _showShortcuts = !_showShortcuts);
+        default:
+          return false;
+      }
+    }
+    return true;
   }
 
   Future<void> _startClip() async {
@@ -280,7 +557,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
           SnackBar(
             content: Text(
               'Start must be at or after your last bookmark\'s end '
-              '(${_formatDuration(lastEnd)}).',
+              '(${formatDuration(lastEnd)}).',
             ),
           ),
         );
@@ -337,6 +614,8 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
       _pendingClipStartSeconds = null;
       _pendingClipEndSeconds = null;
     });
+    _persistClips();
+    FocusManager.instance.primaryFocus?.unfocus();
   }
 
   void _cancelClipNote() {
@@ -344,6 +623,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
       _pendingClipStartSeconds = null;
       _pendingClipEndSeconds = null;
     });
+    FocusManager.instance.primaryFocus?.unfocus();
   }
 
   Future<void> _playClip(VideoClip clip) async {
@@ -432,6 +712,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
 
   void _deleteClip(VideoClip clip) {
     setState(() => _clips.remove(clip));
+    _persistClips();
   }
 
   void _editClipNote(VideoClip clip, String newNote) {
@@ -445,6 +726,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
         note: trimmed.isEmpty ? 'Untitled clip' : trimmed,
       );
     });
+    _persistClips();
   }
 
   // YouTube's oEmbed endpoint needs no API key but only exposes title and
@@ -475,16 +757,21 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     }
 
     if (!mounted || videoId != _activeVideoId) return;
+    // Fall back to the title saved in history (e.g. when offline).
     setState(() {
-      _videoTitle = title;
-      _channelName = channelName;
+      _videoTitle = title ?? _videoTitle;
+      _channelName = channelName ?? _channelName;
       _isLoadingMetadata = false;
-      _metadataError = hasError;
+      _metadataError = hasError && _videoTitle == null;
     });
+    if (title != null) _writeHistory();
   }
 
   @override
   void dispose() {
+    _saveProgress();
+    _lifecycleListener.dispose();
+    HardwareKeyboard.instance.removeHandler(_handleShortcut);
     _urlController.dispose();
     _noteController.dispose();
     _valueSubscription?.cancel();
@@ -508,6 +795,19 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
             ),
           ],
         ),
+        actions: [
+          IconButton(
+            onPressed: () => setState(() => _showShortcuts = !_showShortcuts),
+            icon: const Icon(Icons.keyboard_outlined),
+            tooltip: 'Keyboard shortcuts (?)',
+          ),
+          IconButton(
+            onPressed: _openHistory,
+            icon: const Icon(Icons.history),
+            tooltip: 'Watch history',
+          ),
+          const SizedBox(width: 8),
+        ],
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(1),
           child: Container(height: 1, color: const Color(0xFFE5E5E5)),
@@ -576,6 +876,18 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                     title: _videoTitle,
                     channelName: _channelName,
                   ),
+                  const SizedBox(height: 16),
+                  _PlaybackControls(
+                    playbackRate: _playbackRate,
+                    onRateChanged: _setPlaybackRate,
+                    onSkip: _skip,
+                  ),
+                  if (_showShortcuts) ...[
+                    const SizedBox(height: 12),
+                    _ShortcutsPanel(
+                      onClose: () => setState(() => _showShortcuts = false),
+                    ),
+                  ],
                   const SizedBox(height: 20),
                   Wrap(
                     spacing: 12,
@@ -617,8 +929,8 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                           icon: Icons.bar_chart,
                           label: 'Watched',
                           value: _videoDuration > Duration.zero
-                              ? '${_formatDuration(_furthestWatched)} / ${_formatDuration(_videoDuration)}'
-                              : _formatDuration(_furthestWatched),
+                              ? '${formatDuration(_furthestWatched)} / ${formatDuration(_videoDuration)}'
+                              : formatDuration(_furthestWatched),
                           subtitle: _videoDuration > Duration.zero
                               ? '${(_furthestWatched.inMilliseconds / _videoDuration.inMilliseconds * 100).clamp(0, 100).round()}% complete'
                               : 'Duration not available yet',
@@ -636,12 +948,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                     children: [
                       Expanded(
                         child: OutlinedButton.icon(
-                          onPressed:
-                              _clipStartSeconds == null &&
-                                  _pendingClipStartSeconds == null &&
-                                  !_isPlayingBookmarks
-                              ? _startClip
-                              : null,
+                          onPressed: _canMarkStart ? _startClip : null,
                           icon: const Icon(Icons.flag_outlined),
                           label: const Text('Mark start'),
                           style: OutlinedButton.styleFrom(
@@ -655,9 +962,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                       const SizedBox(width: 12),
                       Expanded(
                         child: ElevatedButton.icon(
-                          onPressed: _clipStartSeconds != null
-                              ? _stopClip
-                              : null,
+                          onPressed: _canMarkStop ? _stopClip : null,
                           icon: const Icon(Icons.stop_circle_outlined),
                           label: const Text('Mark stop & save'),
                         ),
@@ -667,7 +972,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                   if (_clipStartSeconds != null) ...[
                     const SizedBox(height: 8),
                     Text(
-                      'Recording clip from ${_formatDuration(Duration(milliseconds: (_clipStartSeconds! * 1000).round()))}...',
+                      'Recording clip from ${formatDuration(Duration(milliseconds: (_clipStartSeconds! * 1000).round()))}...',
                       style: const TextStyle(
                         color: _brandGreen,
                         fontWeight: FontWeight.w600,
@@ -687,7 +992,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Clip ${_formatDuration(Duration(milliseconds: (_pendingClipStartSeconds! * 1000).round()))} - ${_formatDuration(Duration(milliseconds: (_pendingClipEndSeconds! * 1000).round()))}',
+                            'Clip ${formatDuration(Duration(milliseconds: (_pendingClipStartSeconds! * 1000).round()))} - ${formatDuration(Duration(milliseconds: (_pendingClipEndSeconds! * 1000).round()))}',
                             style: const TextStyle(
                               fontWeight: FontWeight.w600,
                               color: Color(0xFF0F0F0F),
@@ -767,6 +1072,35 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                       ),
                     ),
                   ],
+                ] else if (_recentHistory.isNotEmpty) ...[
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text(
+                        'Continue watching',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF0F0F0F),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: _openHistory,
+                        style: TextButton.styleFrom(
+                          foregroundColor: _brandGreen,
+                        ),
+                        child: const Text('See all'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  ..._recentHistory.map(
+                    (entry) => HistoryTile(
+                      entry: entry,
+                      clipCount: _recentClipCounts[entry.videoId] ?? 0,
+                      onTap: () => _openHistoryVideo(entry.videoId),
+                    ),
+                  ),
                 ] else
                   Container(
                     padding: const EdgeInsets.symmetric(vertical: 60),
@@ -784,6 +1118,173 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _PlaybackControls extends StatelessWidget {
+  const _PlaybackControls({
+    required this.playbackRate,
+    required this.onRateChanged,
+    required this.onSkip,
+  });
+
+  final double playbackRate;
+  final ValueChanged<double> onRateChanged;
+  final ValueChanged<Duration> onSkip;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        IconButton.outlined(
+          onPressed: () => onSkip(const Duration(seconds: -10)),
+          icon: const Icon(Icons.replay_10),
+          tooltip: 'Back 10 seconds (J)',
+          color: _brandGreen,
+        ),
+        const SizedBox(width: 8),
+        IconButton.outlined(
+          onPressed: () => onSkip(const Duration(seconds: 10)),
+          icon: const Icon(Icons.forward_10),
+          tooltip: 'Forward 10 seconds (L)',
+          color: _brandGreen,
+        ),
+        const SizedBox(width: 16),
+        const Icon(Icons.speed, size: 18, color: Color(0xFF606060)),
+        const SizedBox(width: 8),
+        Expanded(
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                for (final rate in _playbackRates)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: ChoiceChip(
+                      label: Text(_formatRate(rate)),
+                      selected: rate == playbackRate,
+                      onSelected: (_) => onRateChanged(rate),
+                      selectedColor: _brandGreen,
+                      labelStyle: TextStyle(
+                        color: rate == playbackRate
+                            ? Colors.white
+                            : const Color(0xFF0F0F0F),
+                        fontWeight: FontWeight.w600,
+                      ),
+                      checkmarkColor: Colors.white,
+                      showCheckmark: false,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// Shown inline rather than as a dialog for the same reason as the clip note
+// panel: on web the YouTube iframe swallows clicks on anything drawn over it.
+class _ShortcutsPanel extends StatelessWidget {
+  const _ShortcutsPanel({required this.onClose});
+
+  final VoidCallback onClose;
+
+  static const _shortcuts = [
+    ('Space / K', 'Play or pause'),
+    ('← / →', 'Back / forward 5 seconds'),
+    ('J / L', 'Back / forward 10 seconds'),
+    ('[', 'Mark bookmark start'),
+    (']', 'Mark bookmark stop'),
+    ('< / >', 'Slower / faster'),
+    ('B', 'Play or stop bookmarks'),
+    ('?', 'Show or hide this list'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 8, 8, 16),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF1F1F1),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  'Keyboard shortcuts',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xFF0F0F0F),
+                  ),
+                ),
+              ),
+              IconButton(
+                onPressed: onClose,
+                icon: const Icon(Icons.close, size: 18),
+                tooltip: 'Close',
+              ),
+            ],
+          ),
+          Wrap(
+            spacing: 24,
+            runSpacing: 8,
+            children: [
+              for (final (keys, action) in _shortcuts)
+                SizedBox(
+                  width: 250,
+                  child: Row(
+                    children: [
+                      Container(
+                        constraints: const BoxConstraints(minWidth: 72),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: const Color(0xFFE5E5E5)),
+                        ),
+                        child: Text(
+                          keys,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w600,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          action,
+                          style: const TextStyle(
+                            color: Color(0xFF606060),
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Click outside the video first — keys pressed while the video '
+            'itself has focus go to YouTube.',
+            style: TextStyle(color: Color(0xFF606060), fontSize: 12),
+          ),
+        ],
       ),
     );
   }
@@ -879,7 +1380,7 @@ class _ClipTile extends StatelessWidget {
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: Text(
-          'Clip ${_formatDuration(clip.start)} - ${_formatDuration(clip.end)}',
+          'Clip ${formatDuration(clip.start)} - ${formatDuration(clip.end)}',
         ),
         content: TextField(
           controller: controller,
@@ -938,7 +1439,7 @@ class _ClipTile extends StatelessWidget {
           ),
         ),
         subtitle: Text(
-          '${_formatDuration(clip.start)} - ${_formatDuration(clip.end)}',
+          '${formatDuration(clip.start)} - ${formatDuration(clip.end)}',
           style: const TextStyle(
             fontWeight: FontWeight.w400,
             color: Color(0xFF0F0F0F),
