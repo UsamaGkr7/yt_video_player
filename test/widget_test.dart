@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:youtube_player_flutter/youtube_player_flutter.dart';
 
+import 'package:ytvideoplayer/history_screen.dart';
 import 'package:ytvideoplayer/main.dart';
 import 'package:ytvideoplayer/notes_pdf.dart';
 import 'package:ytvideoplayer/video_store.dart';
@@ -199,5 +200,74 @@ void main() {
         'https://www.youtube.com/watch?v=abc&t=65s',
       );
     });
+  });
+
+  test('combined PDF holds bookmarks from several videos', () async {
+    const clip = VideoClip(
+      start: Duration(seconds: 1),
+      end: Duration(seconds: 4),
+      note: 'Point',
+    );
+    final videos = [
+      const VideoNotes(videoId: 'a', title: 'First', clips: [clip, clip]),
+      const VideoNotes(videoId: 'b', title: 'Second', clips: [clip]),
+    ];
+
+    final bytes = await buildCombinedNotesPdf(videos: videos);
+
+    expect(String.fromCharCodes(bytes.take(5)), '%PDF-');
+    expect(notesPdfFilename(videos), 'combined-video-notes.pdf');
+    expect(notesPdfFilename(videos.take(1).toList()), 'First-notes.pdf');
+  });
+
+  testWidgets('history select mode picks videos with bookmarks in order', (
+    WidgetTester tester,
+  ) async {
+    const clips =
+        '[{"start":1000,"end":4000,"note":"A"},'
+        '{"start":5000,"end":9000,"note":"B"}]';
+    SharedPreferences.setMockInitialValues({
+      'watch_history':
+          '[{"videoId":"vid1","lastWatched":3,"title":"Video one"},'
+          '{"videoId":"vid2","lastWatched":2,"title":"Video two"},'
+          '{"videoId":"vid3","lastWatched":1,"title":"Video three"}]',
+      'clips_vid1': clips,
+      'clips_vid3': '[{"start":0,"end":2000,"note":"C"}]',
+    });
+
+    tester.view.physicalSize = const Size(1200, 1600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(const MaterialApp(home: HistoryScreen()));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Select'));
+    await tester.pumpAndSettle();
+    expect(find.text('Select videos'), findsOneWidget);
+
+    // Pick video three first, then video one; video two has no bookmarks.
+    await tester.tap(find.text('Video three'));
+    await tester.tap(find.text('Video one'));
+    await tester.tap(find.text('Video two'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('2 selected'), findsOneWidget);
+    expect(find.text('2 videos · 3 bookmarks'), findsOneWidget);
+    expect(
+      find.text('This video has no bookmarks to combine yet.'),
+      findsOneWidget,
+    );
+    // Selection order badges: video three is 1, video one is 2.
+    final badges = tester
+        .widgetList<Text>(
+          find.descendant(
+            of: find.byType(CircleAvatar),
+            matching: find.byType(Text),
+          ),
+        )
+        .map((t) => t.data)
+        .toList();
+    expect(badges, ['2', '1']);
   });
 }

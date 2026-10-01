@@ -5,8 +5,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
-import 'package:pdf/pdf.dart';
-import 'package:printing/printing.dart';
 import 'package:youtube_player_flutter/youtube_player_flutter.dart';
 
 import 'history_screen.dart';
@@ -743,19 +741,6 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     return byStart != 0 ? byStart : a.end.compareTo(b.end);
   }
 
-  String _notesFilename() {
-    final slug = (_videoTitle ?? '')
-        .replaceAll(RegExp(r'[^\w\s-]'), '')
-        .trim()
-        .replaceAll(RegExp(r'\s+'), '-');
-    final base = slug.isEmpty
-        ? 'video-notes'
-        : '${slug.length > 60 ? slug.substring(0, 60) : slug}-notes';
-    return '$base.pdf';
-  }
-
-  // Builds the notes PDF and either opens the print dialog or hands the file
-  // to the platform share sheet (a download on web).
   Future<void> _exportNotes({required bool print}) async {
     final videoId = _activeVideoId;
     if (videoId == null || _clips.isEmpty || _isExporting) return;
@@ -763,28 +748,14 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
 
     setState(() => _isExporting = true);
     try {
-      final assets = await NotesPdfAssets.load();
-      final title = _videoTitle;
-      final channelName = _channelName;
-      final clips = List.of(_clips);
-      final filename = _notesFilename();
-      Future<Uint8List> build(PdfPageFormat format) => buildNotesPdf(
-        videoId: videoId,
-        title: title,
-        channelName: channelName,
-        clips: clips,
-        assets: assets,
-        format: format,
-      );
-
-      if (print) {
-        await Printing.layoutPdf(onLayout: build, name: filename);
-      } else {
-        await Printing.sharePdf(
-          bytes: await build(PdfPageFormat.a4),
-          filename: filename,
-        );
-      }
+      await printOrShareNotes([
+        VideoNotes(
+          videoId: videoId,
+          title: _videoTitle,
+          channelName: _channelName,
+          clips: List.of(_clips),
+        ),
+      ], print: print);
     } catch (error, stackTrace) {
       debugPrint('Notes PDF export failed: $error\n$stackTrace');
       if (!mounted) return;
