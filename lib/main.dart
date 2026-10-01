@@ -5,9 +5,12 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:pdf/pdf.dart';
+import 'package:printing/printing.dart';
 import 'package:youtube_player_flutter/youtube_player_flutter.dart';
 
 import 'history_screen.dart';
+import 'notes_pdf.dart';
 import 'video_store.dart';
 
 const _brandGreen = Color(0xFF33A052);
@@ -18,6 +21,9 @@ const _playbackRates = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 // annoying than useful, so those positions start from the beginning instead.
 const _resumeMargin = Duration(seconds: 10);
 const _progressSaveInterval = Duration(seconds: 5);
+// Consecutive position updates further apart than this are treated as a
+// seek rather than playback, so skipped parts don't count as watched.
+const _maxPlaybackStep = Duration(seconds: 3);
 
 void main() {
   runApp(const MyApp());
@@ -136,7 +142,8 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
   PlayerState _playerState = PlayerState.unknown;
   bool _hasStartedPlaying = false;
   int _playCount = 0;
-  Duration _furthestWatched = Duration.zero;
+  WatchedRanges _watched = WatchedRanges();
+  Duration? _lastPlaybackSample;
   Duration _videoDuration = Duration.zero;
   int _viewCount = 0;
 
@@ -145,6 +152,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
   double _playbackRate = 1.0;
   double? _reportedPlaybackRate;
   bool _showShortcuts = false;
+  bool _isExporting = false;
 
   List<WatchHistoryEntry> _recentHistory = [];
   Map<String, int> _recentClipCounts = {};
@@ -153,6 +161,9 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
   int _bookmarkPlaybackIndex = -1;
   bool _isPlayingBookmarks = false;
   bool _isAdvancingBookmark = false;
+  // After jumping to the next bookmark, position updates can still report
+  // the old position for a moment; ignore end checks until the jump lands.
+  bool _bookmarkSeekLanded = false;
 
   bool get _canMarkStart =>
       _clipStartSeconds == null &&
@@ -160,6 +171,20 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
       !_isPlayingBookmarks;
 
   bool get _canMarkStop => _clipStartSeconds != null;
+
+  Duration get _watchedTotal {
+    final total = _watched.total;
+    return _videoDuration > Duration.zero && total > _videoDuration
+        ? _videoDuration
+        : total;
+  }
+
+  double? get _watchedFraction => _videoDuration > Duration.zero
+      ? (_watchedTotal.inMilliseconds / _videoDuration.inMilliseconds).clamp(
+          0.0,
+          1.0,
+        )
+      : null;
 
   @override
   void initState() {
@@ -212,7 +237,8 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     _playerState = PlayerState.unknown;
     _hasStartedPlaying = false;
     _playCount = 0;
-    _furthestWatched = Duration.zero;
+    _watched = WatchedRanges();
+    _lastPlaybackSample = null;
     _videoDuration = Duration.zero;
     _viewCount = 0;
     _currentPosition = Duration.zero;
@@ -246,9 +272,10 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     _saveProgress();
     final token = ++_loadToken;
 
-    final (entry, clips) = await (
+    final (entry, clips, watched) = await (
       VideoStore.historyEntry(videoId),
       VideoStore.loadClips(videoId),
+      VideoStore.loadWatchedRanges(videoId),
     ).wait;
     // A newer load started while we were reading storage.
     if (!mounted || token != _loadToken) return;
@@ -271,7 +298,10 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
       _videoDuration = entry?.duration ?? Duration.zero;
       _currentPosition = resumeAt ?? Duration.zero;
       _lastSavedPosition = _currentPosition;
-      _clips.addAll(clips);
+      _clips
+        ..addAll(clips)
+        ..sort(_compareClips);
+      _watched = watched;
     });
 
     _valueSubscription = controller.stream.listen(_onPlayerValueChanged);
@@ -326,6 +356,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     final videoId = _activeVideoId;
     if (videoId == null) return;
     _lastSavedPosition = _currentPosition;
+    VideoStore.saveWatchedRanges(videoId, _watched);
     VideoStore.upsertHistory(
       WatchHistoryEntry(
         videoId: videoId,
@@ -397,8 +428,13 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
 
   void _onVideoStateChanged(YoutubeVideoState state) {
     if (!mounted) return;
-    if (state.position > _furthestWatched) {
-      setState(() => _furthestWatched = state.position);
+    final lastSample = _lastPlaybackSample;
+    _lastPlaybackSample = state.position;
+    if (lastSample != null && _playerState == PlayerState.playing) {
+      final step = state.position - lastSample;
+      if (step > Duration.zero && step <= _maxPlaybackStep) {
+        setState(() => _watched.add(lastSample, state.position));
+      }
     }
     if (_hasStartedPlaying) {
       _currentPosition = state.position;
@@ -409,9 +445,16 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     }
     if (_isPlayingBookmarks &&
         _bookmarkPlaybackIndex >= 0 &&
-        _bookmarkPlaybackIndex < _bookmarkPlaybackOrder.length &&
-        state.position >= _bookmarkPlaybackOrder[_bookmarkPlaybackIndex].end) {
-      _advanceBookmarkPlayback();
+        _bookmarkPlaybackIndex < _bookmarkPlaybackOrder.length) {
+      final clip = _bookmarkPlaybackOrder[_bookmarkPlaybackIndex];
+      if (!_bookmarkSeekLanded &&
+          state.position >= clip.start - const Duration(seconds: 1) &&
+          state.position < clip.end) {
+        _bookmarkSeekLanded = true;
+      }
+      if (_bookmarkSeekLanded && state.position >= clip.end) {
+        _advanceBookmarkPlayback();
+      }
     }
   }
 
@@ -548,23 +591,6 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     final seconds = await controller.currentTime;
     if (!mounted) return;
 
-    // Bookmarks must form an increasing, non-overlapping series so the
-    // "play bookmarks" feature can just walk the list in order.
-    if (_clips.isNotEmpty) {
-      final lastEnd = _clips.last.end;
-      if (seconds < lastEnd.inMilliseconds / 1000) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Start must be at or after your last bookmark\'s end '
-              '(${formatDuration(lastEnd)}).',
-            ),
-          ),
-        );
-        return;
-      }
-    }
-
     setState(() => _clipStartSeconds = seconds);
   }
 
@@ -604,13 +630,15 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
 
     final text = _noteController.text.trim();
     setState(() {
-      _clips.add(
-        VideoClip(
-          start: Duration(milliseconds: (start * 1000).round()),
-          end: Duration(milliseconds: (end * 1000).round()),
-          note: text.isEmpty ? 'Untitled clip' : text,
-        ),
-      );
+      _clips
+        ..add(
+          VideoClip(
+            start: Duration(milliseconds: (start * 1000).round()),
+            end: Duration(milliseconds: (end * 1000).round()),
+            note: text.isEmpty ? 'Untitled clip' : text,
+          ),
+        )
+        ..sort(_compareClips);
       _pendingClipStartSeconds = null;
       _pendingClipEndSeconds = null;
     });
@@ -650,9 +678,8 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
   }
 
   // Plays every saved bookmark back to back (1-3, then 8-10, ...), skipping
-  // everything in between. Bookmarks are kept in increasing, non-overlapping
-  // order by the validation in _startClip, so sorting here is just a safety
-  // net.
+  // everything in between. Bookmarks may be added in any order and may
+  // overlap; they are played in order of their start time.
   Future<void> _startBookmarkPlayback() async {
     if (_clips.isEmpty) return;
     final ordered = List<VideoClip>.from(_clips)
@@ -680,6 +707,7 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
     if (index < 0 || index >= _bookmarkPlaybackOrder.length) return;
 
     final clip = _bookmarkPlaybackOrder[index];
+    _bookmarkSeekLanded = false;
     await controller.loadVideoById(
       videoId: videoId,
       startSeconds: clip.start.inMilliseconds / 1000,
@@ -707,6 +735,64 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
       await _seekToBookmark(nextIndex);
     } finally {
       _isAdvancingBookmark = false;
+    }
+  }
+
+  static int _compareClips(VideoClip a, VideoClip b) {
+    final byStart = a.start.compareTo(b.start);
+    return byStart != 0 ? byStart : a.end.compareTo(b.end);
+  }
+
+  String _notesFilename() {
+    final slug = (_videoTitle ?? '')
+        .replaceAll(RegExp(r'[^\w\s-]'), '')
+        .trim()
+        .replaceAll(RegExp(r'\s+'), '-');
+    final base = slug.isEmpty
+        ? 'video-notes'
+        : '${slug.length > 60 ? slug.substring(0, 60) : slug}-notes';
+    return '$base.pdf';
+  }
+
+  // Builds the notes PDF and either opens the print dialog or hands the file
+  // to the platform share sheet (a download on web).
+  Future<void> _exportNotes({required bool print}) async {
+    final videoId = _activeVideoId;
+    if (videoId == null || _clips.isEmpty || _isExporting) return;
+    if (_playerState == PlayerState.playing) _playerController?.pauseVideo();
+
+    setState(() => _isExporting = true);
+    try {
+      final assets = await NotesPdfAssets.load();
+      final title = _videoTitle;
+      final channelName = _channelName;
+      final clips = List.of(_clips);
+      final filename = _notesFilename();
+      Future<Uint8List> build(PdfPageFormat format) => buildNotesPdf(
+        videoId: videoId,
+        title: title,
+        channelName: channelName,
+        clips: clips,
+        assets: assets,
+        format: format,
+      );
+
+      if (print) {
+        await Printing.layoutPdf(onLayout: build, name: filename);
+      } else {
+        await Printing.sharePdf(
+          bytes: await build(PdfPageFormat.a4),
+          filename: filename,
+        );
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Notes PDF export failed: $error\n$stackTrace');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not create the PDF: $error')),
+      );
+    } finally {
+      if (mounted) setState(() => _isExporting = false);
     }
   }
 
@@ -929,16 +1015,12 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                           icon: Icons.bar_chart,
                           label: 'Watched',
                           value: _videoDuration > Duration.zero
-                              ? '${formatDuration(_furthestWatched)} / ${formatDuration(_videoDuration)}'
-                              : formatDuration(_furthestWatched),
-                          subtitle: _videoDuration > Duration.zero
-                              ? '${(_furthestWatched.inMilliseconds / _videoDuration.inMilliseconds * 100).clamp(0, 100).round()}% complete'
+                              ? '${formatDuration(_watchedTotal)} / ${formatDuration(_videoDuration)}'
+                              : formatDuration(_watchedTotal),
+                          subtitle: _watchedFraction != null
+                              ? '${(_watchedFraction! * 100).round()}% actually watched'
                               : 'Duration not available yet',
-                          progress: _videoDuration > Duration.zero
-                              ? (_furthestWatched.inMilliseconds /
-                                        _videoDuration.inMilliseconds)
-                                    .clamp(0.0, 1.0)
-                              : null,
+                          progress: _watchedFraction,
                         ),
                       ),
                     ],
@@ -1034,14 +1116,44 @@ class _YoutubePlayerScreenState extends State<YoutubePlayerScreen> {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        const Text(
-                          'Bookmarks',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w600,
-                            color: Color(0xFF0F0F0F),
+                        const Expanded(
+                          child: Text(
+                            'Bookmarks',
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF0F0F0F),
+                            ),
                           ),
                         ),
+                        if (_isExporting)
+                          const Padding(
+                            padding: EdgeInsets.all(14),
+                            child: SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          )
+                        else ...[
+                          // IconButton(
+                          //   onPressed: () => _exportNotes(print: true),
+                          //   icon: const Icon(
+                          //     Icons.print_outlined,
+                          //     color: _brandGreen,
+                          //   ),
+                          //   tooltip: 'Print notes',
+                          // ),
+                          IconButton(
+                            onPressed: () => _exportNotes(print: false),
+                            icon: const Icon(
+                              Icons.picture_as_pdf_outlined,
+                              color: _brandGreen,
+                            ),
+                            tooltip: 'Save notes as PDF',
+                          ),
+                        ],
                         TextButton.icon(
                           onPressed: _isPlayingBookmarks
                               ? _stopBookmarkPlayback

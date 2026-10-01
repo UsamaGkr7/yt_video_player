@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:youtube_player_flutter/youtube_player_flutter.dart';
 
 import 'package:ytvideoplayer/main.dart';
+import 'package:ytvideoplayer/notes_pdf.dart';
 import 'package:ytvideoplayer/video_store.dart';
 
 void main() {
@@ -127,5 +128,76 @@ void main() {
     expect(find.text('Continue watching'), findsOneWidget);
     expect(find.text('Saved video'), findsOneWidget);
     expect(find.text('1:00 / 2:00'), findsOneWidget);
+  });
+
+  group('WatchedRanges', () {
+    Duration s(int seconds) => Duration(seconds: seconds);
+
+    test('merges overlapping and touching ranges', () {
+      final ranges = WatchedRanges()
+        ..add(s(0), s(10))
+        ..add(s(30), s(40))
+        ..add(s(10), s(12))
+        ..add(s(35), s(50))
+        ..add(s(20), s(25));
+
+      expect(ranges.ranges, [(s(0), s(12)), (s(20), s(25)), (s(30), s(50))]);
+      expect(ranges.total, s(37));
+    });
+
+    test(
+      'skipped parts do not count and re-watching is not double counted',
+      () {
+        final ranges = WatchedRanges()
+          ..add(s(0), s(60))
+          ..add(s(0), s(60));
+        expect(ranges.total, s(60));
+      },
+    );
+
+    test('survives a JSON round trip', () {
+      final ranges = WatchedRanges()
+        ..add(s(5), s(10))
+        ..add(s(20), s(30));
+      final restored = WatchedRanges.fromJson(ranges.toJson());
+      expect(restored.ranges, ranges.ranges);
+    });
+  });
+
+  group('buildNotesPdf', () {
+    test(
+      'creates a PDF for bookmarks, including a note longer than a page',
+      () async {
+        final longNote =
+            'Heading\n${List.filled(400, 'A long line of notes.').join(' ')}';
+        final bytes = await buildNotesPdf(
+          videoId: 'dQw4w9WgXcQ',
+          title: 'Test video',
+          channelName: 'Channel',
+          clips: [
+            const VideoClip(
+              start: Duration(seconds: 90),
+              end: Duration(seconds: 120),
+              note: 'Second',
+            ),
+            VideoClip(
+              start: const Duration(seconds: 5),
+              end: const Duration(seconds: 20),
+              note: longNote,
+            ),
+          ],
+        );
+
+        expect(String.fromCharCodes(bytes.take(5)), '%PDF-');
+        expect(bytes.length, greaterThan(1000));
+      },
+    );
+
+    test('links to the bookmark start time', () {
+      expect(
+        videoUrlAt('abc', const Duration(minutes: 1, seconds: 5)),
+        'https://www.youtube.com/watch?v=abc&t=65s',
+      );
+    });
   });
 }
